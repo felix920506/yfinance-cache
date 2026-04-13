@@ -11,7 +11,7 @@ import json
 import pickle
 import sqlite3
 import threading
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 import pandas as pd
 from zoneinfo import ZoneInfo
@@ -225,7 +225,7 @@ class SqliteCacheBackend:
                 expiry = _deserialize_expiry(existing["expiry"])
 
         blob, json_str = _serialize_datum(datum)
-        now_str = datetime.utcnow().isoformat()
+        now_str = datetime.now(timezone.utc).isoformat()
 
         conn = self._conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -292,7 +292,7 @@ class SqliteCacheBackend:
             ).fetchone()
             if row is None:
                 # Create a placeholder row with null data
-                now_str = datetime.utcnow().isoformat()
+                now_str = datetime.now(timezone.utc).isoformat()
                 md = {key: value} if value is not None else {}
                 conn.execute(
                     """
@@ -345,7 +345,7 @@ class SqliteCacheBackend:
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?,?)",
-                (f"_YFC_/{flag_name}", datetime.utcnow().isoformat()),
+                (f"_YFC_/{flag_name}", datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
         except Exception:

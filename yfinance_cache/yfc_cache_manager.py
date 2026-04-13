@@ -38,6 +38,21 @@ verbose = False
 
 global cacheDirpath
 
+# Active SQLite backend instance (None when using the file backend)
+_sqlite_backend = None
+
+
+def _get_backend():
+    """Return the active SqliteCacheBackend, or None for the file backend."""
+    global _sqlite_backend
+    if _option_manager.cache.cache_backend == 'sqlite':
+        if _sqlite_backend is None:
+            from .yfc_sqlite_manager import SqliteCacheBackend
+            db_path = os.path.join(GetCacheDirpath(), 'yfc_cache.db')
+            _sqlite_backend = SqliteCacheBackend(db_path)
+        return _sqlite_backend
+    return None
+
 
 def GetCacheDirpath():
     global cacheDirpath
@@ -50,10 +65,14 @@ def ResetCacheDirpath():
 
 
 def SetCacheDirpath(dp):
-    global cacheDirpath
+    global cacheDirpath, _sqlite_backend
     cacheDirpath = dp
     if verbose:
         print("Set cache dir to {0}".format(cacheDirpath))
+
+    if _sqlite_backend is not None:
+        _sqlite_backend.close()
+        _sqlite_backend = None
 
     global _option_manager
     _option_manager = OptionsManager()
@@ -129,6 +148,10 @@ def GetFilepathPacked(ticker, objectName):
 
 
 def IsDatumCached(ticker, objectName):
+    b = _get_backend()
+    if b is not None:
+        return b.is_datum_cached(ticker, objectName)
+
     if verbose:
         print("IsDatumCached({0}, {1})".format(ticker, objectName))
 
@@ -186,6 +209,10 @@ def _ReadPackedData(ticker, objectName):
 
 
 def ReadCacheDatum(ticker, objectName, return_metadata_too=False):
+    b = _get_backend()
+    if b is not None:
+        return b.read_datum(ticker, objectName, return_metadata_too)
+
     if verbose:
         print("ReadCacheDatum({0}, {1})".format(ticker, objectName))
 
@@ -223,6 +250,11 @@ def ReadCacheDatum(ticker, objectName, return_metadata_too=False):
 
 
 def ReadCachePackedDatum(ticker, objectName, return_metadata_too=False):
+    b = _get_backend()
+    if b is not None:
+        # In SQLite mode packing is irrelevant; every object is its own row.
+        return b.read_datum(ticker, objectName, return_metadata_too)
+
     if verbose:
         print("ReadCachePackedDatum({0}, {1})".format(ticker, objectName))
 
@@ -263,6 +295,17 @@ def ReadCachePackedDatum(ticker, objectName, return_metadata_too=False):
 
 
 def StoreCacheDatum(ticker, objectName, datum, expiry=None, metadata=None):
+    b = _get_backend()
+    if b is not None:
+        if expiry is not None:
+            if isinstance(expiry, yfcd.Interval):
+                expiry = pd.Timestamp.utcnow().replace(tzinfo=ZoneInfo("UTC")) + yfcd.intervalToTimedelta[expiry]
+            if not isinstance(expiry, datetime):
+                raise Exception("'expiry' must be datetime or yfcd.Interval")
+        pack_name = GetPackedDataCat(objectName)
+        b.store_datum(ticker, objectName, datum, expiry=expiry, metadata=metadata, pack_name=pack_name)
+        return
+
     if verbose:
         print("StoreCacheDatum({0}, {1})".format(ticker, objectName))
 
@@ -327,6 +370,17 @@ def StoreCacheDatum(ticker, objectName, datum, expiry=None, metadata=None):
 
 
 def StoreCachePackedDatum(ticker, objectName, datum, expiry=None, metadata=None):
+    b = _get_backend()
+    if b is not None:
+        if expiry is not None:
+            if isinstance(expiry, yfcd.Interval):
+                expiry = pd.Timestamp.utcnow().replace(tzinfo=ZoneInfo("UTC")) + yfcd.intervalToTimedelta[expiry]
+            if not isinstance(expiry, datetime):
+                raise Exception("'expiry' must be datetime or yfcd.Interval")
+        pack_name = GetPackedDataCat(objectName)
+        b.store_datum(ticker, objectName, datum, expiry=expiry, metadata=metadata, pack_name=pack_name)
+        return
+
     if verbose:
         print("StoreCachePackedDatum({0}, {1})".format(ticker, objectName))
 
@@ -385,6 +439,10 @@ def StoreCachePackedDatum(ticker, objectName, datum, expiry=None, metadata=None)
 
 
 def ReadCacheMetadata(ticker, objectName, key):
+    b = _get_backend()
+    if b is not None:
+        return b.read_metadata_key(ticker, objectName, key)
+
     md = None
     if IsObjectInPackedData(objectName):
         pkData = _ReadPackedData(ticker, objectName)
@@ -408,6 +466,11 @@ def ReadCacheMetadata(ticker, objectName, key):
 
 
 def WriteCacheMetadata(ticker, objectName, key, value):
+    b = _get_backend()
+    if b is not None:
+        b.write_metadata_key(ticker, objectName, key, value)
+        return
+
     if IsObjectInPackedData(objectName):
         return WriteCachePackedMetadata(ticker, objectName, key, value)
 
@@ -444,6 +507,11 @@ def WriteCacheMetadata(ticker, objectName, key, value):
 
 
 def WriteCachePackedMetadata(ticker, objectName, key, value):
+    b = _get_backend()
+    if b is not None:
+        b.write_metadata_key(ticker, objectName, key, value)
+        return
+
     if not IsObjectInPackedData(objectName):
         return WriteCacheMetadata(ticker, objectName)
 
@@ -466,6 +534,38 @@ def WriteCachePackedMetadata(ticker, objectName, key, value):
 ResetCacheDirpath()
 
 
+# ---------------------------------------------------------------------------
+# Upgrade-sentinel shims — backend-aware wrappers for yfc_upgrade.py
+# ---------------------------------------------------------------------------
+
+def IsUpgradeFlagSet(flag_name: str) -> bool:
+    b = _get_backend()
+    if b is not None:
+        return b.has_upgrade_flag(flag_name)
+    yfc_dp = os.path.join(GetCacheDirpath(), "_YFC_")
+    return os.path.isfile(os.path.join(yfc_dp, flag_name))
+
+
+def SetUpgradeFlag(flag_name: str):
+    b = _get_backend()
+    if b is not None:
+        b.set_upgrade_flag(flag_name)
+        return
+    yfc_dp = os.path.join(GetCacheDirpath(), "_YFC_")
+    os.makedirs(yfc_dp, exist_ok=True)
+    open(os.path.join(yfc_dp, flag_name), 'w').close()
+
+
+def ListTickers() -> list:
+    b = _get_backend()
+    if b is not None:
+        return b.list_tickers()
+    dp = GetCacheDirpath()
+    if not os.path.isdir(dp):
+        return []
+    return [x for x in os.listdir(dp) if x not in ('options.json', '_YFC_')]
+
+
 class NestedOptions:
     def __init__(self, name, data, persistent=True):
         self.__dict__['name'] = name
@@ -479,6 +579,9 @@ class NestedOptions:
         if self.name == 'max_ages':
             # Type-check value
             pd.Timedelta(value)
+        elif self.name == 'cache' and key == 'cache_backend':
+            if value not in ('files', 'sqlite'):
+                raise ValueError(f"cache_backend must be 'files' or 'sqlite', got {value!r}")
 
         self.data[key] = value
 
@@ -517,6 +620,8 @@ class OptionsManager:
             a.analysis = '91d'
             c = self.__getattr__('calendar')
             c.accept_unexpected_Yahoo_intervals = True
+            b = self.__getattr__('cache')
+            b.cache_backend = 'files'
             self._disable_save = False
             self._save_option()
 

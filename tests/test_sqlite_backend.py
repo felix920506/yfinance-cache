@@ -155,17 +155,9 @@ class Test_SqliteBackend(unittest.TestCase):
     # Pack name preservation
     # ------------------------------------------------------------------
 
-    def test_pack_name_stored(self):
-        self.backend.store_datum('AAPL', 'balance_sheet', 100.0, pack_name='annuals')
-        self.backend.store_datum('AAPL', 'cashflow', 200.0, pack_name='annuals')
-        row = self.backend._conn().execute(
-            "SELECT pack_name FROM cache_data WHERE ticker='AAPL' AND object_name='balance_sheet'"
-        ).fetchone()
-        self.assertEqual(row[0], 'annuals')
-
     def test_packed_objects_readable(self):
-        self.backend.store_datum('AAPL', 'balance_sheet', 100.0, pack_name='annuals')
-        self.backend.store_datum('AAPL', 'cashflow', 200.0, pack_name='annuals')
+        self.backend.store_datum('AAPL', 'balance_sheet', 100.0)
+        self.backend.store_datum('AAPL', 'cashflow', 200.0)
         self.assertEqual(self.backend.read_datum('AAPL', 'balance_sheet'), 100.0)
         self.assertEqual(self.backend.read_datum('AAPL', 'cashflow'), 200.0)
 

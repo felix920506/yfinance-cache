@@ -91,7 +91,6 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cache_data (
     ticker      TEXT NOT NULL,
     object_name TEXT NOT NULL,
-    pack_name   TEXT,
     data_blob   BLOB,
     data_json   TEXT,
     metadata    TEXT,
@@ -207,7 +206,6 @@ class SqliteCacheBackend:
         datum,
         expiry: datetime | None = None,
         metadata: dict | None = None,
-        pack_name: str | None = None,
     ):
         if datum is None:
             self.delete_datum(ticker, object_name)
@@ -233,11 +231,10 @@ class SqliteCacheBackend:
             conn.execute(
                 """
                 INSERT INTO cache_data
-                    (ticker, object_name, pack_name, data_blob, data_json,
+                    (ticker, object_name, data_blob, data_json,
                      metadata, expiry, updated_at)
-                VALUES (?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?)
                 ON CONFLICT(ticker, object_name) DO UPDATE SET
-                    pack_name  = excluded.pack_name,
                     data_blob  = excluded.data_blob,
                     data_json  = excluded.data_json,
                     metadata   = excluded.metadata,
@@ -245,7 +242,7 @@ class SqliteCacheBackend:
                     updated_at = excluded.updated_at
                 """,
                 (
-                    ticker, object_name, pack_name,
+                    ticker, object_name,
                     blob, json_str,
                     _serialize_metadata(metadata),
                     _serialize_expiry(expiry),

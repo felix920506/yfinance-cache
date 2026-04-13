@@ -302,8 +302,7 @@ def StoreCacheDatum(ticker, objectName, datum, expiry=None, metadata=None):
                 expiry = pd.Timestamp.utcnow().replace(tzinfo=ZoneInfo("UTC")) + yfcd.intervalToTimedelta[expiry]
             if not isinstance(expiry, datetime):
                 raise Exception("'expiry' must be datetime or yfcd.Interval")
-        pack_name = GetPackedDataCat(objectName)
-        b.store_datum(ticker, objectName, datum, expiry=expiry, metadata=metadata, pack_name=pack_name)
+        b.store_datum(ticker, objectName, datum, expiry=expiry, metadata=metadata)
         return
 
     if verbose:
@@ -377,8 +376,7 @@ def StoreCachePackedDatum(ticker, objectName, datum, expiry=None, metadata=None)
                 expiry = pd.Timestamp.utcnow().replace(tzinfo=ZoneInfo("UTC")) + yfcd.intervalToTimedelta[expiry]
             if not isinstance(expiry, datetime):
                 raise Exception("'expiry' must be datetime or yfcd.Interval")
-        pack_name = GetPackedDataCat(objectName)
-        b.store_datum(ticker, objectName, datum, expiry=expiry, metadata=metadata, pack_name=pack_name)
+        b.store_datum(ticker, objectName, datum, expiry=expiry, metadata=metadata)
         return
 
     if verbose:

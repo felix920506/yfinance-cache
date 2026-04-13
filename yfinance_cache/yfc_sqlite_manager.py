@@ -212,7 +212,16 @@ def _col_text(df: pd.DataFrame, name: str) -> list:
 
 def _should_use_json(datum) -> bool:
     if isinstance(datum, list):
-        return len(datum) == 0 or isinstance(datum[0], (int, float, str, datetime, date, timedelta))
+        # Check the whole list, not just the first element.  Checking only
+        # datum[0] would miss later elements with non-serialisable types and
+        # cause json.dumps() to raise inside _serialize_kv with no fallback.
+        if len(datum) == 0:
+            return True
+        try:
+            json.dumps(datum, default=yfcu.JsonEncodeValue)
+            return True
+        except (TypeError, OverflowError):
+            return False
     if isinstance(datum, dict):
         try:
             json.dumps(datum, default=yfcu.JsonEncodeValue)

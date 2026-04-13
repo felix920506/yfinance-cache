@@ -1,10 +1,12 @@
 """
 SQLite-based cache backend for yfinance-cache.
 
-Provides SqliteCacheBackend, a drop-in alternative to the file-based
-backend in yfc_cache_manager.py.  Each (ticker, object_name) pair maps
-to a single row in the cache_data table; serialisation format (pickle
-blob vs. JSON text) is chosen by the same rules as the file backend.
+Structured objects (price history, dividends, splits, earnings dates) are
+stored in proper relational tables with typed columns.  Everything else
+(info, calendar, financials, …) goes into a catch-all KV table.
+
+Public API is identical to the old blob-only version so no changes are
+needed in yfc_cache_manager.py.
 """
 
 import json
@@ -20,38 +22,213 @@ from . import yfc_utils as yfcu
 
 
 # ---------------------------------------------------------------------------
-# Serialisation helpers
+# Schema
 # ---------------------------------------------------------------------------
 
-def _is_json_serialisable_scalar(obj) -> bool:
-    return isinstance(obj, (int, float, str, datetime, date, timedelta))
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS cache_kv (
+    ticker      TEXT NOT NULL,
+    object_name TEXT NOT NULL,
+    data_blob   BLOB,
+    data_json   TEXT,
+    PRIMARY KEY (ticker, object_name)
+);
 
+CREATE TABLE IF NOT EXISTS object_metadata (
+    ticker        TEXT NOT NULL,
+    object_name   TEXT NOT NULL,
+    metadata_json TEXT,
+    expiry_ns     INTEGER,
+    tz_name       TEXT,
+    PRIMARY KEY (ticker, object_name)
+);
+
+CREATE TABLE IF NOT EXISTS price_history (
+    ticker            TEXT    NOT NULL,
+    interval          TEXT    NOT NULL,
+    dt_ns             INTEGER NOT NULL,
+    open              REAL,
+    high              REAL,
+    low               REAL,
+    close             REAL,
+    volume            REAL,
+    dividends         REAL,
+    splits            REAL,
+    fetch_date_ns     INTEGER,
+    final             INTEGER,
+    c_check           INTEGER,
+    csf               REAL,
+    cdf               REAL,
+    last_div_adj_ns   INTEGER,
+    last_split_adj_ns INTEGER,
+    repaired          INTEGER,
+    PRIMARY KEY (ticker, interval, dt_ns)
+);
+
+CREATE TABLE IF NOT EXISTS dividends (
+    ticker              TEXT    NOT NULL,
+    dt_ns               INTEGER NOT NULL,
+    amount              REAL,
+    fetch_date_ns       INTEGER,
+    close_before        REAL,
+    close_repaired      INTEGER,
+    back_adj            REAL,
+    superseded_div      REAL,
+    superseded_back_adj REAL,
+    superseded_fetch_ns INTEGER,
+    PRIMARY KEY (ticker, dt_ns)
+);
+
+CREATE TABLE IF NOT EXISTS splits (
+    ticker              TEXT    NOT NULL,
+    dt_ns               INTEGER NOT NULL,
+    ratio               REAL,
+    fetch_date_ns       INTEGER,
+    superseded_split    REAL,
+    superseded_fetch_ns INTEGER,
+    PRIMARY KEY (ticker, dt_ns)
+);
+
+CREATE TABLE IF NOT EXISTS earnings_dates (
+    ticker         TEXT    NOT NULL,
+    dt_ns          INTEGER NOT NULL,
+    reported_eps   REAL,
+    expected_eps   REAL,
+    surprise_pct   REAL,
+    event_type     TEXT,
+    fetch_date_ns  INTEGER,
+    date_confirmed INTEGER,
+    PRIMARY KEY (ticker, dt_ns)
+);
+
+CREATE TABLE IF NOT EXISTS cache_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+"""
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+
+_STRUCTURED = frozenset({'dividends', 'splits', 'earnings_dates'})
+
+
+def _route(object_name: str) -> tuple:
+    """Return (table_name, extra).  extra is the interval for price_history."""
+    if object_name.startswith('history-'):
+        return 'price_history', object_name[8:]
+    if object_name in _STRUCTURED:
+        return object_name, None
+    return 'cache_kv', None
+
+
+# ---------------------------------------------------------------------------
+# Datetime helpers  (all datetimes stored as UTC nanoseconds INTEGER)
+# ---------------------------------------------------------------------------
+
+def _dt_to_ns(ts) -> int | None:
+    """Timezone-aware Timestamp/datetime → UTC nanoseconds. None for NaT/None."""
+    if ts is None:
+        return None
+    try:
+        ts = pd.Timestamp(ts)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return int(ts.value)   # .value is always UTC ns
+
+
+def _ns_to_ts(ns: int | None, tz=None) -> pd.Timestamp | None:
+    """UTC ns integer → Timestamp, optionally tz-converted."""
+    if ns is None:
+        return None
+    ts = pd.Timestamp(ns, unit='ns', tz='UTC')
+    if tz is not None:
+        ts = ts.tz_convert(tz)
+    return ts
+
+
+def _bool_to_int(v) -> int | None:
+    if v is None:
+        return None
+    try:
+        if pd.isna(v):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return int(bool(v))
+
+
+def _int_to_bool(v) -> bool | None:
+    return None if v is None else bool(v)
+
+
+def _real(v) -> float | None:
+    """Scalar → float, NaN → None."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        return None if pd.isna(f) else f
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Column-array builders (vectorised helpers for DataFrame → SQL)
+# ---------------------------------------------------------------------------
+
+def _col_real(df: pd.DataFrame, name: str) -> list:
+    if name not in df.columns:
+        return [None] * len(df)
+    return [_real(v) for v in df[name]]
+
+
+def _col_dt_ns(df: pd.DataFrame, name: str) -> list:
+    if name not in df.columns:
+        return [None] * len(df)
+    return [_dt_to_ns(v) for v in df[name]]
+
+
+def _col_bool(df: pd.DataFrame, name: str) -> list:
+    if name not in df.columns:
+        return [None] * len(df)
+    return [_bool_to_int(v) for v in df[name]]
+
+
+def _col_text(df: pd.DataFrame, name: str) -> list:
+    if name not in df.columns:
+        return [None] * len(df)
+    return [None if (v is None or (isinstance(v, float) and pd.isna(v))) else str(v)
+            for v in df[name]]
+
+
+# ---------------------------------------------------------------------------
+# KV serialisation helpers (JSON or pickle blob)
+# ---------------------------------------------------------------------------
 
 def _should_use_json(datum) -> bool:
-    """Mirror the file-backend logic in GetFilepath for ext selection."""
     if isinstance(datum, list):
-        if len(datum) == 0 or isinstance(datum[0], (int, float, str, datetime, date, timedelta)):
-            return True
-        return False
+        return len(datum) == 0 or isinstance(datum[0], (int, float, str, datetime, date, timedelta))
     if isinstance(datum, dict):
         try:
             json.dumps(datum, default=yfcu.JsonEncodeValue)
             return True
         except (TypeError, OverflowError):
             return False
-    if _is_json_serialisable_scalar(datum):
-        return True
-    return False
+    return isinstance(datum, (int, float, str, datetime, date, timedelta))
 
 
-def _serialize_datum(datum) -> tuple:
+def _serialize_kv(datum) -> tuple:
     """Return (blob, json_str) — exactly one is non-None."""
     if _should_use_json(datum):
         return None, json.dumps(datum, default=yfcu.JsonEncodeValue)
     return pickle.dumps(datum, protocol=4), None
 
 
-def _deserialize_datum(blob, json_str):
+def _deserialize_kv(blob, json_str):
     if json_str is not None:
         return json.loads(json_str, object_hook=yfcu.JsonDecodeDict)
     if blob is not None:
@@ -60,62 +237,30 @@ def _deserialize_datum(blob, json_str):
 
 
 def _serialize_metadata(md: dict | None) -> str | None:
-    if md is None:
+    if not md:
         return None
     return json.dumps(md, default=yfcu.JsonEncodeValue)
 
 
-def _deserialize_metadata(json_str: str | None) -> dict | None:
-    if json_str is None:
+def _deserialize_metadata(s: str | None) -> dict | None:
+    if not s:
         return None
-    return json.loads(json_str, object_hook=yfcu.JsonDecodeDict)
+    return json.loads(s, object_hook=yfcu.JsonDecodeDict)
 
 
-def _serialize_expiry(expiry: datetime | None) -> str | None:
-    if expiry is None:
-        return None
-    return expiry.isoformat()
-
-
-def _deserialize_expiry(s: str | None) -> datetime | None:
-    if s is None:
-        return None
-    return datetime.fromisoformat(s)
+def _serialize_expiry(expiry) -> int | None:
+    return _dt_to_ns(expiry)
 
 
 # ---------------------------------------------------------------------------
 # Backend class
 # ---------------------------------------------------------------------------
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS cache_data (
-    ticker      TEXT NOT NULL,
-    object_name TEXT NOT NULL,
-    data_blob   BLOB,
-    data_json   TEXT,
-    metadata    TEXT,
-    expiry      TEXT,
-    updated_at  TEXT NOT NULL,
-    PRIMARY KEY (ticker, object_name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_expiry
-    ON cache_data(expiry)
-    WHERE expiry IS NOT NULL;
-
-CREATE TABLE IF NOT EXISTS cache_meta (
-    key   TEXT PRIMARY KEY,
-    value TEXT
-);
-"""
-
-
 class SqliteCacheBackend:
     """
     SQLite-backed cache with per-thread connections and WAL mode.
 
-    All public methods mirror the file-backend functions in
-    yfc_cache_manager so the dispatcher can call them directly.
+    Structured objects use typed tables; everything else uses cache_kv.
     """
 
     def __init__(self, db_path: str):
@@ -130,7 +275,6 @@ class SqliteCacheBackend:
     # ------------------------------------------------------------------
 
     def _conn(self) -> sqlite3.Connection:
-        """Return the per-thread connection, creating it lazily."""
         conn = getattr(self._local, 'conn', None)
         if conn is None:
             conn = sqlite3.connect(
@@ -140,7 +284,6 @@ class SqliteCacheBackend:
             )
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
         return conn
@@ -153,113 +296,455 @@ class SqliteCacheBackend:
             self._schema_created = True
 
     def close(self):
-        """Close the current thread's connection."""
         conn = getattr(self._local, 'conn', None)
         if conn is not None:
             conn.close()
             self._local.conn = None
 
     # ------------------------------------------------------------------
-    # Core CRUD
+    # Internal: metadata table
+    # ------------------------------------------------------------------
+
+    def _read_object_metadata(self, ticker: str, object_name: str):
+        """Return (tz_name, metadata_dict, expiry_ns)."""
+        row = self._conn().execute(
+            "SELECT metadata_json, expiry_ns, tz_name "
+            "FROM object_metadata WHERE ticker=? AND object_name=?",
+            (ticker, object_name),
+        ).fetchone()
+        if row is None:
+            return None, None, None
+        return row['tz_name'], _deserialize_metadata(row['metadata_json']), row['expiry_ns']
+
+    def _upsert_object_metadata(self, conn, ticker, object_name,
+                                 metadata, expiry, tz_name):
+        """Write metadata, preserving existing values for None args."""
+        existing = conn.execute(
+            "SELECT metadata_json, expiry_ns, tz_name "
+            "FROM object_metadata WHERE ticker=? AND object_name=?",
+            (ticker, object_name),
+        ).fetchone()
+
+        if existing is not None:
+            md_json  = _serialize_metadata(metadata) if metadata is not None \
+                       else existing['metadata_json']
+            exp_ns   = _serialize_expiry(expiry) if expiry is not None \
+                       else existing['expiry_ns']
+            tz_final = tz_name if tz_name is not None else existing['tz_name']
+        else:
+            md_json  = _serialize_metadata(metadata)
+            exp_ns   = _serialize_expiry(expiry)
+            tz_final = tz_name
+
+        conn.execute(
+            """INSERT OR REPLACE INTO object_metadata
+                (ticker, object_name, metadata_json, expiry_ns, tz_name)
+               VALUES (?,?,?,?,?)""",
+            (ticker, object_name, md_json, exp_ns, tz_final),
+        )
+
+    def _check_and_delete_if_expired(self, ticker: str, object_name: str) -> bool:
+        """Return True if the KV item has expired (also deletes it)."""
+        row = self._conn().execute(
+            "SELECT expiry_ns FROM object_metadata WHERE ticker=? AND object_name=?",
+            (ticker, object_name),
+        ).fetchone()
+        if row is None or row['expiry_ns'] is None:
+            return False
+        now_ns = int(pd.Timestamp.now('UTC').value)
+        if now_ns >= row['expiry_ns']:
+            self.delete_datum(ticker, object_name)
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Internal: structured table writers
+    # ------------------------------------------------------------------
+
+    def _store_price_history(self, conn, ticker: str, interval: str, df: pd.DataFrame):
+        conn.execute(
+            "DELETE FROM price_history WHERE ticker=? AND interval=?",
+            (ticker, interval),
+        )
+        if df.empty:
+            return
+
+        n = len(df)
+        dt_ns = df.index.asi8.tolist()   # UTC ns from DatetimeIndex (always UTC internally)
+
+        rows = list(zip(
+            [ticker] * n, [interval] * n, dt_ns,
+            _col_real(df, 'Open'),
+            _col_real(df, 'High'),
+            _col_real(df, 'Low'),
+            _col_real(df, 'Close'),
+            _col_real(df, 'Volume'),
+            _col_real(df, 'Dividends'),
+            _col_real(df, 'Stock Splits'),
+            _col_dt_ns(df, 'FetchDate'),
+            _col_bool(df, 'Final?'),
+            _col_bool(df, 'C-Check?'),
+            _col_real(df, 'CSF'),
+            _col_real(df, 'CDF'),
+            _col_dt_ns(df, 'LastDivAdjustDt'),
+            _col_dt_ns(df, 'LastSplitAdjustDt'),
+            _col_bool(df, 'Repaired?'),
+        ))
+
+        conn.executemany(
+            """INSERT INTO price_history
+                (ticker, interval, dt_ns, open, high, low, close, volume,
+                 dividends, splits, fetch_date_ns, final, c_check, csf, cdf,
+                 last_div_adj_ns, last_split_adj_ns, repaired)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            rows,
+        )
+
+    def _store_dividends(self, conn, ticker: str, df: pd.DataFrame):
+        conn.execute("DELETE FROM dividends WHERE ticker=?", (ticker,))
+        if df.empty:
+            return
+        n = len(df)
+        rows = list(zip(
+            [ticker] * n, df.index.asi8.tolist(),
+            _col_real(df, 'Dividends'),
+            _col_dt_ns(df, 'FetchDate'),
+            _col_real(df, 'Close before'),
+            _col_bool(df, 'Close repaired?'),
+            _col_real(df, 'Back Adj.'),
+            _col_real(df, 'Superseded div'),
+            _col_real(df, 'Superseded back adj.'),
+            _col_dt_ns(df, 'Superseded div FetchDate'),
+        ))
+        conn.executemany(
+            """INSERT INTO dividends
+                (ticker, dt_ns, amount, fetch_date_ns, close_before, close_repaired,
+                 back_adj, superseded_div, superseded_back_adj, superseded_fetch_ns)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            rows,
+        )
+
+    def _store_splits(self, conn, ticker: str, df: pd.DataFrame):
+        conn.execute("DELETE FROM splits WHERE ticker=?", (ticker,))
+        if df.empty:
+            return
+        n = len(df)
+        rows = list(zip(
+            [ticker] * n, df.index.asi8.tolist(),
+            _col_real(df, 'Stock Splits'),
+            _col_dt_ns(df, 'FetchDate'),
+            _col_real(df, 'Superseded split'),
+            _col_dt_ns(df, 'Superseded split FetchDate'),
+        ))
+        conn.executemany(
+            """INSERT INTO splits
+                (ticker, dt_ns, ratio, fetch_date_ns, superseded_split, superseded_fetch_ns)
+               VALUES (?,?,?,?,?,?)""",
+            rows,
+        )
+
+    def _store_earnings_dates(self, conn, ticker: str, df: pd.DataFrame):
+        conn.execute("DELETE FROM earnings_dates WHERE ticker=?", (ticker,))
+        if df.empty:
+            return
+        n = len(df)
+        rows = list(zip(
+            [ticker] * n, df.index.asi8.tolist(),
+            _col_real(df, 'Reported EPS'),
+            _col_real(df, 'Expected EPS'),
+            _col_real(df, 'Surprise(%)'),
+            _col_text(df, 'Event Type'),
+            _col_dt_ns(df, 'FetchDate'),
+            _col_bool(df, 'Date confirmed?'),
+        ))
+        conn.executemany(
+            """INSERT INTO earnings_dates
+                (ticker, dt_ns, reported_eps, expected_eps, surprise_pct,
+                 event_type, fetch_date_ns, date_confirmed)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            rows,
+        )
+
+    def _store_kv(self, conn, ticker: str, object_name: str, datum):
+        blob, json_str = _serialize_kv(datum)
+        conn.execute(
+            """INSERT OR REPLACE INTO cache_kv (ticker, object_name, data_blob, data_json)
+               VALUES (?,?,?,?)""",
+            (ticker, object_name, blob, json_str),
+        )
+
+    # ------------------------------------------------------------------
+    # Internal: structured table readers
+    # ------------------------------------------------------------------
+
+    def _make_index(self, ns_list: list, tz_name: str | None) -> pd.DatetimeIndex:
+        idx = pd.DatetimeIndex(pd.to_datetime(ns_list, unit='ns', utc=True))
+        if tz_name:
+            idx = idx.tz_convert(tz_name)
+        return idx
+
+    def _read_price_history(self, ticker: str, interval: str,
+                             tz_name: str | None) -> pd.DataFrame | None:
+        rows = self._conn().execute(
+            "SELECT * FROM price_history WHERE ticker=? AND interval=? ORDER BY dt_ns",
+            (ticker, interval),
+        ).fetchall()
+        if not rows:
+            return None
+
+        index = self._make_index([r['dt_ns'] for r in rows], tz_name)
+
+        df = pd.DataFrame(index=index)
+        df.index.name = None
+
+        df['Open']         = pd.array([r['open']      for r in rows], dtype='float64')
+        df['High']         = pd.array([r['high']      for r in rows], dtype='float64')
+        df['Low']          = pd.array([r['low']       for r in rows], dtype='float64')
+        df['Close']        = pd.array([r['close']     for r in rows], dtype='float64')
+        df['Volume']       = pd.array([r['volume']    for r in rows], dtype='float64')
+        df['Dividends']    = pd.array([r['dividends'] for r in rows], dtype='float64')
+        df['Stock Splits'] = pd.array([r['splits']    for r in rows], dtype='float64')
+
+        # FetchDate: UTC-aware datetime column
+        df['FetchDate'] = pd.DatetimeIndex(
+            pd.to_datetime([r['fetch_date_ns'] if r['fetch_date_ns'] is not None
+                            else pd.NaT for r in rows], unit='ns', utc=True)
+        )
+
+        df['Final?'] = pd.array(
+            [bool(r['final']) if r['final'] is not None else False for r in rows],
+            dtype='bool',
+        )
+
+        # Optional columns — only include if at least one non-NULL value
+        _opt_bool = [('c_check', 'C-Check?'), ('repaired', 'Repaired?')]
+        for sql_col, df_col in _opt_bool:
+            vals = [r[sql_col] for r in rows]
+            if any(v is not None for v in vals):
+                df[df_col] = pd.array(
+                    [bool(v) if v is not None else False for v in vals],
+                    dtype='bool',
+                )
+
+        _opt_real = [('csf', 'CSF'), ('cdf', 'CDF')]
+        for sql_col, df_col in _opt_real:
+            vals = [r[sql_col] for r in rows]
+            if any(v is not None for v in vals):
+                df[df_col] = pd.array(vals, dtype='float64')
+
+        _opt_dt = [('last_div_adj_ns', 'LastDivAdjustDt'),
+                   ('last_split_adj_ns', 'LastSplitAdjustDt')]
+        for sql_col, df_col in _opt_dt:
+            vals = [r[sql_col] for r in rows]
+            if any(v is not None for v in vals):
+                df[df_col] = pd.DatetimeIndex(
+                    pd.to_datetime([v if v is not None else pd.NaT for v in vals],
+                                   unit='ns', utc=True)
+                )
+
+        return df
+
+    def _read_dividends(self, ticker: str, tz_name: str | None) -> pd.DataFrame | None:
+        rows = self._conn().execute(
+            "SELECT * FROM dividends WHERE ticker=? ORDER BY dt_ns", (ticker,)
+        ).fetchall()
+        if not rows:
+            return None
+
+        index = self._make_index([r['dt_ns'] for r in rows], tz_name)
+
+        def _fetch_dates(key):
+            return pd.DatetimeIndex(
+                pd.to_datetime([r[key] if r[key] is not None else pd.NaT for r in rows],
+                               unit='ns', utc=True)
+            )
+
+        df = pd.DataFrame({
+            'Dividends':               pd.array([r['amount']              for r in rows], dtype='float64'),
+            'Back Adj.':               pd.array([r['back_adj']            for r in rows], dtype='float64'),
+            'FetchDate':               _fetch_dates('fetch_date_ns'),
+            'Close before':            pd.array([r['close_before']        for r in rows], dtype='float64'),
+            'Close repaired?':         pd.array([bool(r['close_repaired']) if r['close_repaired'] is not None
+                                                  else False for r in rows], dtype='bool'),
+            'Superseded div':          pd.array([r['superseded_div']      for r in rows], dtype='float64'),
+            'Superseded back adj.':    pd.array([r['superseded_back_adj'] for r in rows], dtype='float64'),
+            'Superseded div FetchDate': _fetch_dates('superseded_fetch_ns'),
+        }, index=index)
+
+        return df
+
+    def _read_splits(self, ticker: str, tz_name: str | None) -> pd.DataFrame | None:
+        rows = self._conn().execute(
+            "SELECT * FROM splits WHERE ticker=? ORDER BY dt_ns", (ticker,)
+        ).fetchall()
+        if not rows:
+            return None
+
+        index = self._make_index([r['dt_ns'] for r in rows], tz_name)
+
+        def _fetch_dates(key):
+            return pd.DatetimeIndex(
+                pd.to_datetime([r[key] if r[key] is not None else pd.NaT for r in rows],
+                               unit='ns', utc=True)
+            )
+
+        df = pd.DataFrame({
+            'Stock Splits':              pd.array([r['ratio']           for r in rows], dtype='float64'),
+            'FetchDate':                 _fetch_dates('fetch_date_ns'),
+            'Superseded split':          pd.array([r['superseded_split'] for r in rows], dtype='float64'),
+            'Superseded split FetchDate': _fetch_dates('superseded_fetch_ns'),
+        }, index=index)
+
+        return df
+
+    def _read_earnings_dates(self, ticker: str, tz_name: str | None) -> pd.DataFrame | None:
+        rows = self._conn().execute(
+            "SELECT * FROM earnings_dates WHERE ticker=? ORDER BY dt_ns", (ticker,)
+        ).fetchall()
+        if not rows:
+            return None
+
+        index = self._make_index([r['dt_ns'] for r in rows], tz_name)
+
+        def _fetch_dates(key):
+            return pd.DatetimeIndex(
+                pd.to_datetime([r[key] if r[key] is not None else pd.NaT for r in rows],
+                               unit='ns', utc=True)
+            )
+
+        df = pd.DataFrame({
+            'Reported EPS':  pd.array([r['reported_eps']  for r in rows], dtype='float64'),
+            'Expected EPS':  pd.array([r['expected_eps']  for r in rows], dtype='float64'),
+            'Surprise(%)':   pd.array([r['surprise_pct']  for r in rows], dtype='float64'),
+            'Event Type':    [r['event_type']              for r in rows],
+            'FetchDate':     _fetch_dates('fetch_date_ns'),
+            'Date confirmed?': pd.array([bool(r['date_confirmed']) if r['date_confirmed'] is not None
+                                          else False for r in rows], dtype='bool'),
+        }, index=index)
+
+        return df
+
+    def _read_kv(self, ticker: str, object_name: str):
+        row = self._conn().execute(
+            "SELECT data_blob, data_json FROM cache_kv WHERE ticker=? AND object_name=?",
+            (ticker, object_name),
+        ).fetchone()
+        if row is None:
+            return None
+        return _deserialize_kv(row['data_blob'], row['data_json'])
+
+    # ------------------------------------------------------------------
+    # Public API
     # ------------------------------------------------------------------
 
     def is_datum_cached(self, ticker: str, object_name: str) -> bool:
-        row = self._conn().execute(
-            "SELECT 1 FROM cache_data WHERE ticker=? AND object_name=?",
-            (ticker, object_name),
-        ).fetchone()
+        table, extra = _route(object_name)
+        conn = self._conn()
+        if table == 'price_history':
+            row = conn.execute(
+                "SELECT 1 FROM price_history WHERE ticker=? AND interval=? LIMIT 1",
+                (ticker, extra),
+            ).fetchone()
+        elif table in _STRUCTURED:
+            row = conn.execute(
+                f"SELECT 1 FROM {table} WHERE ticker=? LIMIT 1",
+                (ticker,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM cache_kv WHERE ticker=? AND object_name=? LIMIT 1",
+                (ticker, object_name),
+            ).fetchone()
         return row is not None
 
-    def read_datum(self, ticker: str, object_name: str, return_metadata_too: bool = False):
-        row = self._conn().execute(
-            "SELECT data_blob, data_json, metadata, expiry "
-            "FROM cache_data WHERE ticker=? AND object_name=?",
-            (ticker, object_name),
-        ).fetchone()
+    def read_datum(self, ticker: str, object_name: str,
+                   return_metadata_too: bool = False):
+        table, extra = _route(object_name)
 
-        if row is None:
+        # Expiry only applies to KV objects
+        if table == 'cache_kv' and self._check_and_delete_if_expired(ticker, object_name):
             return (None, None) if return_metadata_too else None
 
-        # Expiry check
-        expiry = _deserialize_expiry(row["expiry"])
-        if expiry is not None:
-            now = pd.Timestamp.utcnow().replace(tzinfo=ZoneInfo("UTC"))
-            if now >= expiry:
-                self.delete_datum(ticker, object_name)
-                return (None, None) if return_metadata_too else None
+        tz_name, md, expiry_ns = self._read_object_metadata(ticker, object_name)
 
-        data = _deserialize_datum(row["data_blob"], row["data_json"])
-        md = _deserialize_metadata(row["metadata"])
+        if table == 'price_history':
+            data = self._read_price_history(ticker, extra, tz_name)
+        elif table == 'dividends':
+            data = self._read_dividends(ticker, tz_name)
+        elif table == 'splits':
+            data = self._read_splits(ticker, tz_name)
+        elif table == 'earnings_dates':
+            data = self._read_earnings_dates(ticker, tz_name)
+        else:
+            data = self._read_kv(ticker, object_name)
 
-        if expiry is not None:
+        if data is None:
+            return (None, None) if return_metadata_too else None
+
+        if expiry_ns is not None:
+            expiry_ts = _ns_to_ts(expiry_ns)
             if md is None:
-                md = {"__expiry__": expiry}
+                md = {'__expiry__': expiry_ts}
             else:
-                md["__expiry__"] = expiry
+                md['__expiry__'] = expiry_ts
 
         return (data, md) if return_metadata_too else data
 
-    def store_datum(
-        self,
-        ticker: str,
-        object_name: str,
-        datum,
-        expiry: datetime | None = None,
-        metadata: dict | None = None,
-    ):
+    def store_datum(self, ticker: str, object_name: str, datum,
+                    expiry=None, metadata=None):
         if datum is None:
             self.delete_datum(ticker, object_name)
             return
 
-        # Preserve existing metadata/expiry if caller passes None
-        existing = self._conn().execute(
-            "SELECT metadata, expiry FROM cache_data WHERE ticker=? AND object_name=?",
-            (ticker, object_name),
-        ).fetchone()
-        if existing is not None:
-            if metadata is None:
-                metadata = _deserialize_metadata(existing["metadata"])
-            if expiry is None:
-                expiry = _deserialize_expiry(existing["expiry"])
+        table, extra = _route(object_name)
 
-        blob, json_str = _serialize_datum(datum)
-        now_str = datetime.now(timezone.utc).isoformat()
+        # Derive timezone name from DataFrame index (if applicable)
+        tz_name = None
+        if isinstance(datum, (pd.DataFrame, pd.Series)):
+            tz = getattr(datum.index, 'tz', None)
+            if tz is not None:
+                tz_name = str(tz)
 
         conn = self._conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                """
-                INSERT INTO cache_data
-                    (ticker, object_name, data_blob, data_json,
-                     metadata, expiry, updated_at)
-                VALUES (?,?,?,?,?,?,?)
-                ON CONFLICT(ticker, object_name) DO UPDATE SET
-                    data_blob  = excluded.data_blob,
-                    data_json  = excluded.data_json,
-                    metadata   = excluded.metadata,
-                    expiry     = excluded.expiry,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    ticker, object_name,
-                    blob, json_str,
-                    _serialize_metadata(metadata),
-                    _serialize_expiry(expiry),
-                    now_str,
-                ),
-            )
+            if table == 'price_history':
+                self._store_price_history(conn, ticker, extra, datum)
+            elif table == 'dividends':
+                self._store_dividends(conn, ticker, datum)
+            elif table == 'splits':
+                self._store_splits(conn, ticker, datum)
+            elif table == 'earnings_dates':
+                self._store_earnings_dates(conn, ticker, datum)
+            else:
+                self._store_kv(conn, ticker, object_name, datum)
+
+            self._upsert_object_metadata(conn, ticker, object_name,
+                                          metadata, expiry, tz_name)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
 
     def delete_datum(self, ticker: str, object_name: str):
+        table, extra = _route(object_name)
         conn = self._conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
+            if table == 'price_history':
+                conn.execute(
+                    "DELETE FROM price_history WHERE ticker=? AND interval=?",
+                    (ticker, extra),
+                )
+            elif table in _STRUCTURED:
+                conn.execute(f"DELETE FROM {table} WHERE ticker=?", (ticker,))
+            else:
+                conn.execute(
+                    "DELETE FROM cache_kv WHERE ticker=? AND object_name=?",
+                    (ticker, object_name),
+                )
             conn.execute(
-                "DELETE FROM cache_data WHERE ticker=? AND object_name=?",
+                "DELETE FROM object_metadata WHERE ticker=? AND object_name=?",
                 (ticker, object_name),
             )
             conn.commit()
@@ -269,60 +754,57 @@ class SqliteCacheBackend:
 
     def read_metadata_key(self, ticker: str, object_name: str, key: str):
         row = self._conn().execute(
-            "SELECT metadata FROM cache_data WHERE ticker=? AND object_name=?",
+            "SELECT metadata_json FROM object_metadata WHERE ticker=? AND object_name=?",
             (ticker, object_name),
         ).fetchone()
         if row is None:
             return None
-        md = _deserialize_metadata(row["metadata"])
-        if md is None:
-            return None
-        return md.get(key)
+        md = _deserialize_metadata(row['metadata_json'])
+        return None if md is None else md.get(key)
 
     def write_metadata_key(self, ticker: str, object_name: str, key: str, value):
         conn = self._conn()
         conn.execute("BEGIN IMMEDIATE")
         try:
             row = conn.execute(
-                "SELECT metadata FROM cache_data WHERE ticker=? AND object_name=?",
+                "SELECT metadata_json FROM object_metadata WHERE ticker=? AND object_name=?",
                 (ticker, object_name),
             ).fetchone()
             if row is None:
-                # Create a placeholder row with null data
-                now_str = datetime.now(timezone.utc).isoformat()
                 md = {key: value} if value is not None else {}
                 conn.execute(
-                    """
-                    INSERT INTO cache_data
-                        (ticker, object_name, pack_name, data_blob, data_json,
-                         metadata, expiry, updated_at)
-                    VALUES (?,?,NULL,NULL,NULL,?,NULL,?)
-                    """,
-                    (ticker, object_name, _serialize_metadata(md), now_str),
+                    """INSERT INTO object_metadata
+                        (ticker, object_name, metadata_json, expiry_ns, tz_name)
+                       VALUES (?,?,?,NULL,NULL)""",
+                    (ticker, object_name, _serialize_metadata(md)),
                 )
             else:
-                md = _deserialize_metadata(row["metadata"]) or {}
+                md = _deserialize_metadata(row['metadata_json']) or {}
                 if value is None:
                     md.pop(key, None)
                 else:
                     md[key] = value
                 conn.execute(
-                    "UPDATE cache_data SET metadata=? WHERE ticker=? AND object_name=?",
-                    (_serialize_metadata(md), ticker, object_name),
+                    "UPDATE object_metadata SET metadata_json=? WHERE ticker=? AND object_name=?",
+                    (_serialize_metadata(md) or None, ticker, object_name),
                 )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
 
-    # ------------------------------------------------------------------
-    # Ticker enumeration
-    # ------------------------------------------------------------------
-
     def list_tickers(self) -> list:
-        rows = self._conn().execute(
-            "SELECT DISTINCT ticker FROM cache_data"
-        ).fetchall()
+        rows = self._conn().execute("""
+            SELECT DISTINCT ticker FROM cache_kv
+            UNION
+            SELECT DISTINCT ticker FROM price_history
+            UNION
+            SELECT DISTINCT ticker FROM dividends
+            UNION
+            SELECT DISTINCT ticker FROM splits
+            UNION
+            SELECT DISTINCT ticker FROM earnings_dates
+        """).fetchall()
         return [r[0] for r in rows]
 
     # ------------------------------------------------------------------
@@ -342,7 +824,8 @@ class SqliteCacheBackend:
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?,?)",
-                (f"_YFC_/{flag_name}", datetime.now(timezone.utc).isoformat()),
+                (f"_YFC_/{flag_name}",
+                 datetime.now(timezone.utc).isoformat()),
             )
             conn.commit()
         except Exception:

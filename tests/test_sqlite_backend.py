@@ -60,9 +60,10 @@ class Test_SqliteBackend(unittest.TestCase):
         self.assertEqual(result, d)
 
     def test_store_and_read_dataframe(self):
+        # Use a non-structured key so the DataFrame goes through the KV path
         df = pd.DataFrame({'x': [1, 2, 3], 'y': [4.0, 5.0, 6.0]})
-        self.backend.store_datum('AAPL', 'history-1d', df)
-        result = self.backend.read_datum('AAPL', 'history-1d')
+        self.backend.store_datum('AAPL', 'some-df', df)
+        result = self.backend.read_datum('AAPL', 'some-df')
         pd.testing.assert_frame_equal(result, df)
 
     def test_is_datum_cached_true(self):
@@ -220,7 +221,7 @@ class Test_SqliteBackend(unittest.TestCase):
         self.assertEqual(errors, [], errors)
         # Verify counts
         conn = self.backend._conn()
-        count = conn.execute("SELECT COUNT(*) FROM cache_data").fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM cache_kv").fetchone()[0]
         self.assertEqual(count, num_threads * writes_per_thread)
 
     def test_concurrent_expiry_read(self):
@@ -242,6 +243,249 @@ class Test_SqliteBackend(unittest.TestCase):
             t.join()
 
         self.assertEqual(errors, [], errors)
+
+    # ------------------------------------------------------------------
+    # Structured tables
+    # ------------------------------------------------------------------
+
+    def _make_price_df(self, tz='US/Eastern', with_optional=False):
+        """Minimal price DataFrame that matches the structured schema."""
+        tz_info = ZoneInfo(tz)
+        index = pd.DatetimeIndex([
+            datetime(2024, 1, 2, 9, 30, tzinfo=tz_info),
+            datetime(2024, 1, 3, 9, 30, tzinfo=tz_info),
+            datetime(2024, 1, 4, 9, 30, tzinfo=tz_info),
+        ])
+        df = pd.DataFrame({
+            'Open':         [150.0, 151.0, 152.0],
+            'High':         [155.0, 156.0, 157.0],
+            'Low':          [149.0, 150.0, 151.0],
+            'Close':        [153.0, 154.0, 155.0],
+            'Volume':       [1e6, 1.1e6, 1.2e6],
+            'Dividends':    [0.0, 0.0, 0.0],
+            'Stock Splits': [0.0, 0.0, 0.0],
+            'FetchDate':    pd.DatetimeIndex([
+                pd.Timestamp('2024-01-03', tz='UTC'),
+                pd.Timestamp('2024-01-04', tz='UTC'),
+                pd.Timestamp('2024-01-05', tz='UTC'),
+            ]),
+            'Final?': [True, True, False],
+        }, index=index)
+        if with_optional:
+            df['CSF']       = [1.0, 1.0, 1.0]
+            df['CDF']       = [1.0, 1.0, 1.0]
+            df['C-Check?']  = [True, True, False]
+            df['Repaired?'] = [False, False, False]
+        return df
+
+    def test_price_history_structured(self):
+        """Store a price DataFrame, verify SQL rows, read back and compare."""
+        df = self._make_price_df()
+        self.backend.store_datum('AAPL', 'history-1d', df)
+
+        # Check SQL rows exist in price_history
+        conn = self.backend._conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM price_history WHERE ticker='AAPL' AND interval='1d'"
+        ).fetchone()[0]
+        self.assertEqual(count, 3)
+
+        # cache_kv should NOT have this entry
+        kv_count = conn.execute(
+            "SELECT COUNT(*) FROM cache_kv WHERE ticker='AAPL'"
+        ).fetchone()[0]
+        self.assertEqual(kv_count, 0)
+
+        result = self.backend.read_datum('AAPL', 'history-1d')
+        self.assertIsNotNone(result)
+        # Compare core columns
+        for col in ['Open', 'High', 'Low', 'Close', 'Volume', 'Dividends',
+                    'Stock Splits', 'Final?']:
+            pd.testing.assert_series_equal(
+                result[col].reset_index(drop=True),
+                df[col].reset_index(drop=True),
+                check_names=False,
+            )
+
+    def test_price_history_timezone(self):
+        """Index timezone is preserved round-trip."""
+        df = self._make_price_df(tz='US/Eastern')
+        self.backend.store_datum('AAPL', 'history-1d', df)
+        result = self.backend.read_datum('AAPL', 'history-1d')
+        self.assertEqual(str(result.index.tz), 'US/Eastern')
+        # Compare UTC nanosecond values; both represent the same instants
+        import numpy as np
+        np.testing.assert_array_equal(df.index.asi8, result.index.asi8)
+
+    def test_price_history_optional_columns_absent(self):
+        """Optional columns are NOT present when data had none."""
+        df = self._make_price_df(with_optional=False)
+        self.backend.store_datum('AAPL', 'history-1d', df)
+        result = self.backend.read_datum('AAPL', 'history-1d')
+        for col in ('CSF', 'CDF', 'C-Check?', 'Repaired?',
+                    'LastDivAdjustDt', 'LastSplitAdjustDt'):
+            self.assertNotIn(col, result.columns, f"Column {col!r} should be absent")
+
+    def test_price_history_optional_columns_present(self):
+        """Optional columns appear when data has at least one non-NULL value."""
+        df = self._make_price_df(with_optional=True)
+        self.backend.store_datum('AAPL', 'history-1d', df)
+        result = self.backend.read_datum('AAPL', 'history-1d')
+        for col in ('CSF', 'CDF', 'C-Check?', 'Repaired?'):
+            self.assertIn(col, result.columns, f"Column {col!r} should be present")
+
+    def test_dividends_structured(self):
+        """Store and read a dividends DataFrame via the structured table."""
+        tz_info = ZoneInfo('US/Eastern')
+        index = pd.DatetimeIndex([
+            datetime(2024, 2, 15, 9, 30, tzinfo=tz_info),
+            datetime(2024, 5, 16, 9, 30, tzinfo=tz_info),
+        ])
+        df = pd.DataFrame({
+            'Dividends':               [0.24, 0.24],
+            'Back Adj.':               [0.24, 0.24],
+            'FetchDate':               pd.DatetimeIndex([
+                pd.Timestamp('2024-02-16', tz='UTC'),
+                pd.Timestamp('2024-05-17', tz='UTC'),
+            ]),
+            'Close before':            [185.0, 190.0],
+            'Close repaired?':         [False, False],
+            'Superseded div':          [float('nan'), float('nan')],
+            'Superseded back adj.':    [float('nan'), float('nan')],
+            'Superseded div FetchDate': pd.DatetimeIndex(
+                [pd.NaT, pd.NaT], dtype='datetime64[ns, UTC]'
+            ),
+        }, index=index)
+
+        self.backend.store_datum('AAPL', 'dividends', df)
+
+        conn = self.backend._conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM dividends WHERE ticker='AAPL'"
+        ).fetchone()[0]
+        self.assertEqual(count, 2)
+
+        result = self.backend.read_datum('AAPL', 'dividends')
+        self.assertIsNotNone(result)
+        pd.testing.assert_series_equal(
+            result['Dividends'].reset_index(drop=True),
+            df['Dividends'].reset_index(drop=True),
+            check_names=False,
+        )
+        self.assertEqual(str(result.index.tz), 'US/Eastern')
+        import numpy as np
+        np.testing.assert_array_equal(df.index.asi8, result.index.asi8)
+
+    def test_splits_structured(self):
+        """Store and read a splits DataFrame via the structured table."""
+        tz_info = ZoneInfo('US/Eastern')
+        index = pd.DatetimeIndex([
+            datetime(2020, 8, 31, 9, 30, tzinfo=tz_info),
+        ])
+        df = pd.DataFrame({
+            'Stock Splits':              [4.0],
+            'FetchDate':                 pd.DatetimeIndex([
+                pd.Timestamp('2020-09-01', tz='UTC'),
+            ]),
+            'Superseded split':          [float('nan')],
+            'Superseded split FetchDate': pd.DatetimeIndex(
+                [pd.NaT], dtype='datetime64[ns, UTC]'
+            ),
+        }, index=index)
+
+        self.backend.store_datum('AAPL', 'splits', df)
+
+        conn = self.backend._conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM splits WHERE ticker='AAPL'"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+        result = self.backend.read_datum('AAPL', 'splits')
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result['Stock Splits'].iloc[0], 4.0)
+
+    def test_earnings_dates_structured(self):
+        """Store and read an earnings_dates DataFrame via the structured table."""
+        tz_info = ZoneInfo('US/Eastern')
+        index = pd.DatetimeIndex([
+            datetime(2024, 2, 1, 16, 30, tzinfo=tz_info),
+            datetime(2024, 5, 2, 16, 30, tzinfo=tz_info),
+        ])
+        df = pd.DataFrame({
+            'Reported EPS':  [2.18, 1.53],
+            'Expected EPS':  [2.10, 1.50],
+            'Surprise(%)':   [3.8, 2.0],
+            'Event Type':    ['Quarterly', 'Quarterly'],
+            'FetchDate':     pd.DatetimeIndex([
+                pd.Timestamp('2024-02-02', tz='UTC'),
+                pd.Timestamp('2024-05-03', tz='UTC'),
+            ]),
+            'Date confirmed?': [True, True],
+        }, index=index)
+
+        self.backend.store_datum('AAPL', 'earnings_dates', df)
+
+        conn = self.backend._conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM earnings_dates WHERE ticker='AAPL'"
+        ).fetchone()[0]
+        self.assertEqual(count, 2)
+
+        result = self.backend.read_datum('AAPL', 'earnings_dates')
+        self.assertIsNotNone(result)
+        self.assertEqual(str(result.index.tz), 'US/Eastern')
+        import numpy as np
+        np.testing.assert_array_equal(df.index.asi8, result.index.asi8)
+        self.assertEqual(list(result['Event Type']), ['Quarterly', 'Quarterly'])
+        self.assertTrue(all(result['Date confirmed?']))
+
+    def test_kv_still_works_for_non_structured(self):
+        """Non-structured keys (info, calendar, etc.) still use cache_kv."""
+        payload = {'name': 'Apple Inc.', 'sector': 'Technology'}
+        self.backend.store_datum('AAPL', 'info', payload)
+
+        conn = self.backend._conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM cache_kv WHERE ticker='AAPL' AND object_name='info'"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+        result = self.backend.read_datum('AAPL', 'info')
+        self.assertEqual(result, payload)
+
+    def test_price_history_replace(self):
+        """Storing a new DataFrame for the same (ticker, interval) replaces old rows."""
+        df1 = self._make_price_df()
+        self.backend.store_datum('AAPL', 'history-1d', df1)
+
+        tz_info = ZoneInfo('US/Eastern')
+        index2 = pd.DatetimeIndex([datetime(2024, 1, 5, 9, 30, tzinfo=tz_info)])
+        df2 = pd.DataFrame({
+            'Open': [160.0], 'High': [165.0], 'Low': [159.0], 'Close': [163.0],
+            'Volume': [2e6], 'Dividends': [0.0], 'Stock Splits': [0.0],
+            'FetchDate': pd.DatetimeIndex([pd.Timestamp('2024-01-06', tz='UTC')]),
+            'Final?': [True],
+        }, index=index2)
+        self.backend.store_datum('AAPL', 'history-1d', df2)
+
+        conn = self.backend._conn()
+        count = conn.execute(
+            "SELECT COUNT(*) FROM price_history WHERE ticker='AAPL' AND interval='1d'"
+        ).fetchone()[0]
+        self.assertEqual(count, 1)
+
+        result = self.backend.read_datum('AAPL', 'history-1d')
+        self.assertAlmostEqual(result['Open'].iloc[0], 160.0)
+
+    def test_list_tickers_includes_structured(self):
+        """list_tickers() returns tickers from structured tables too."""
+        df = self._make_price_df()
+        self.backend.store_datum('AAPL', 'history-1d', df)
+        self.backend.store_datum('MSFT', 'info', {'x': 1})
+        tickers = set(self.backend.list_tickers())
+        self.assertIn('AAPL', tickers)
+        self.assertIn('MSFT', tickers)
 
 
 if __name__ == '__main__':

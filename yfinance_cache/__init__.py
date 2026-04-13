@@ -39,3 +39,5 @@ _fix_financials_dtypes()
 from .yfc_upgrade import _fix_xcals_being_unordered
 _fix_xcals_being_unordered()
 
+from .yfc_migrate import migrate_to_sqlite, migrate_to_files
+

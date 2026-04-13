@@ -194,6 +194,21 @@ class Test_SqliteBackend(unittest.TestCase):
         self.backend.delete_upgrade_flag('flag-x')
         self.assertFalse(self.backend.has_upgrade_flag('flag-x'))
 
+    def test_list_upgrade_flags_no_wildcard_false_positive(self):
+        """LIKE '_YFC_/%' must not match keys whose '_' chars are SQL wildcards.
+
+        Without ESCAPE the pattern '_YFC_/%' would match e.g. 'XYFC_/foo'
+        because '_' is a single-char wildcard in SQL LIKE.
+        """
+        conn = self.backend._conn()
+        # Insert a key that LIKE '_YFC_/%' without ESCAPE would match
+        conn.execute("INSERT OR REPLACE INTO cache_meta (key, value) VALUES (?, ?)",
+                     ('XYFCX/impostor', 'bad'))
+        conn.commit()
+        flags = self.backend.list_upgrade_flags()
+        self.assertNotIn('impostor', flags,
+                         "list_upgrade_flags() matched a key via SQL wildcard '_'")
+
     # ------------------------------------------------------------------
     # Concurrency
     # ------------------------------------------------------------------

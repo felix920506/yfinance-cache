@@ -851,8 +851,11 @@ class SqliteCacheBackend:
             raise
 
     def list_upgrade_flags(self) -> list:
+        # Use ESCAPE to treat the '_' characters in '_YFC_/' as literals.
+        # Without escaping, '_' is a single-character wildcard in SQL LIKE and
+        # the pattern would incorrectly match keys like 'XYFCX/...'.
         rows = self._conn().execute(
-            "SELECT key FROM cache_meta WHERE key LIKE '_YFC_/%'"
+            r"SELECT key FROM cache_meta WHERE key LIKE '\_YFC\_/%' ESCAPE '\'"
         ).fetchall()
         return [r[0].removeprefix("_YFC_/") for r in rows]
 

@@ -113,6 +113,16 @@ CREATE TABLE IF NOT EXISTS cache_meta (
 
 _STRUCTURED = frozenset({'dividends', 'splits', 'earnings_dates'})
 
+# Pre-built SQL strings for structured tables used in is_datum_cached() and
+# delete_datum().  Using a dict avoids f-string table-name interpolation which
+# is a SQL-injection pattern (even though _route() validates the name first).
+_SELECT_1_BY_TICKER: dict[str, str] = {
+    t: f"SELECT 1 FROM {t} WHERE ticker=? LIMIT 1" for t in _STRUCTURED
+}
+_DELETE_BY_TICKER: dict[str, str] = {
+    t: f"DELETE FROM {t} WHERE ticker=?" for t in _STRUCTURED
+}
+
 
 def _route(object_name: str) -> tuple:
     """Return (table_name, extra).  extra is the interval for price_history."""
@@ -700,10 +710,7 @@ class SqliteCacheBackend:
                 (ticker, extra),
             ).fetchone()
         elif table in _STRUCTURED:
-            row = conn.execute(
-                f"SELECT 1 FROM {table} WHERE ticker=? LIMIT 1",
-                (ticker,),
-            ).fetchone()
+            row = conn.execute(_SELECT_1_BY_TICKER[table], (ticker,)).fetchone()
         else:
             row = conn.execute(
                 "SELECT 1 FROM cache_kv WHERE ticker=? AND object_name=? LIMIT 1",
@@ -791,7 +798,7 @@ class SqliteCacheBackend:
                     (ticker, extra),
                 )
             elif table in _STRUCTURED:
-                conn.execute(f"DELETE FROM {table} WHERE ticker=?", (ticker,))
+                conn.execute(_DELETE_BY_TICKER[table], (ticker,))
             else:
                 conn.execute(
                     "DELETE FROM cache_kv WHERE ticker=? AND object_name=?",

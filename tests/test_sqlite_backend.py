@@ -334,6 +334,14 @@ class Test_SqliteBackend(unittest.TestCase):
         import numpy as np
         np.testing.assert_array_equal(df.index.asi8, result.index.asi8)
 
+    def test_price_history_index_name_preserved(self):
+        """Index name (e.g. 'Datetime') is preserved across a store/read round-trip."""
+        df = self._make_price_df()
+        df.index.name = 'Datetime'
+        self.backend.store_datum('AAPL', 'history-1d', df)
+        result = self.backend.read_datum('AAPL', 'history-1d')
+        self.assertEqual(result.index.name, 'Datetime')
+
     def test_price_history_optional_columns_absent(self):
         """Optional columns are NOT present when data had none."""
         df = self._make_price_df(with_optional=False)

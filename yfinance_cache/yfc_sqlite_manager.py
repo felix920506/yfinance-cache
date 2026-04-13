@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS object_metadata (
     metadata_json TEXT,
     expiry_ns     INTEGER,
     tz_name       TEXT,
+    index_name    TEXT,
     PRIMARY KEY (ticker, object_name)
 );
 
@@ -353,41 +354,44 @@ class SqliteCacheBackend:
     # ------------------------------------------------------------------
 
     def _read_object_metadata(self, ticker: str, object_name: str):
-        """Return (tz_name, metadata_dict, expiry_ns)."""
+        """Return (tz_name, index_name, metadata_dict, expiry_ns)."""
         row = self._conn().execute(
-            "SELECT metadata_json, expiry_ns, tz_name "
+            "SELECT metadata_json, expiry_ns, tz_name, index_name "
             "FROM object_metadata WHERE ticker=? AND object_name=?",
             (ticker, object_name),
         ).fetchone()
         if row is None:
-            return None, None, None
-        return row['tz_name'], _deserialize_metadata(row['metadata_json']), row['expiry_ns']
+            return None, None, None, None
+        return (row['tz_name'], row['index_name'],
+                _deserialize_metadata(row['metadata_json']), row['expiry_ns'])
 
     def _upsert_object_metadata(self, conn, ticker, object_name,
-                                 metadata, expiry, tz_name):
+                                 metadata, expiry, tz_name, index_name):
         """Write metadata, preserving existing values for None args."""
         existing = conn.execute(
-            "SELECT metadata_json, expiry_ns, tz_name "
+            "SELECT metadata_json, expiry_ns, tz_name, index_name "
             "FROM object_metadata WHERE ticker=? AND object_name=?",
             (ticker, object_name),
         ).fetchone()
 
         if existing is not None:
-            md_json  = _serialize_metadata(metadata) if metadata is not None \
-                       else existing['metadata_json']
-            exp_ns   = _serialize_expiry(expiry) if expiry is not None \
-                       else existing['expiry_ns']
-            tz_final = tz_name if tz_name is not None else existing['tz_name']
+            md_json     = _serialize_metadata(metadata) if metadata is not None \
+                          else existing['metadata_json']
+            exp_ns      = _serialize_expiry(expiry) if expiry is not None \
+                          else existing['expiry_ns']
+            tz_final    = tz_name    if tz_name    is not None else existing['tz_name']
+            idx_final   = index_name if index_name is not None else existing['index_name']
         else:
-            md_json  = _serialize_metadata(metadata)
-            exp_ns   = _serialize_expiry(expiry)
-            tz_final = tz_name
+            md_json   = _serialize_metadata(metadata)
+            exp_ns    = _serialize_expiry(expiry)
+            tz_final  = tz_name
+            idx_final = index_name
 
         conn.execute(
             """INSERT OR REPLACE INTO object_metadata
-                (ticker, object_name, metadata_json, expiry_ns, tz_name)
-               VALUES (?,?,?,?,?)""",
-            (ticker, object_name, md_json, exp_ns, tz_final),
+                (ticker, object_name, metadata_json, expiry_ns, tz_name, index_name)
+               VALUES (?,?,?,?,?,?)""",
+            (ticker, object_name, md_json, exp_ns, tz_final, idx_final),
         )
 
     def _check_and_delete_if_expired(self, ticker: str, object_name: str) -> bool:
@@ -561,7 +565,6 @@ class SqliteCacheBackend:
         index = self._make_index([r['dt_ns'] for r in rows], tz_name)
 
         df = pd.DataFrame(index=index)
-        df.index.name = None
 
         df['Open']         = pd.array([r['open']      for r in rows], dtype='float64')
         df['High']         = pd.array([r['high']      for r in rows], dtype='float64')
@@ -726,7 +729,7 @@ class SqliteCacheBackend:
         if table == 'cache_kv' and self._check_and_delete_if_expired(ticker, object_name):
             return (None, None) if return_metadata_too else None
 
-        tz_name, md, expiry_ns = self._read_object_metadata(ticker, object_name)
+        tz_name, index_name, md, expiry_ns = self._read_object_metadata(ticker, object_name)
 
         if table == 'price_history':
             data = self._read_price_history(ticker, extra, tz_name)
@@ -741,6 +744,10 @@ class SqliteCacheBackend:
 
         if data is None:
             return (None, None) if return_metadata_too else None
+
+        # Restore the original index name (e.g. 'Datetime', 'Date') if one was stored.
+        if index_name is not None and hasattr(data, 'index'):
+            data.index.name = index_name
 
         if expiry_ns is not None:
             expiry_ts = _ns_to_ts(expiry_ns)
@@ -759,12 +766,16 @@ class SqliteCacheBackend:
 
         table, extra = _route(object_name)
 
-        # Derive timezone name from DataFrame index (if applicable)
+        # Derive timezone name and index name from DataFrame/Series index.
         tz_name = None
+        index_name = None
         if isinstance(datum, (pd.DataFrame, pd.Series)):
             tz = getattr(datum.index, 'tz', None)
             if tz is not None:
                 tz_name = str(tz)
+            raw_name = getattr(datum.index, 'name', None)
+            if raw_name is not None:
+                index_name = str(raw_name)
 
         conn = self._conn()
         conn.execute("BEGIN IMMEDIATE")
@@ -781,7 +792,7 @@ class SqliteCacheBackend:
                 self._store_kv(conn, ticker, object_name, datum)
 
             self._upsert_object_metadata(conn, ticker, object_name,
-                                          metadata, expiry, tz_name)
+                                          metadata, expiry, tz_name, index_name)
             conn.commit()
         except Exception:
             conn.rollback()

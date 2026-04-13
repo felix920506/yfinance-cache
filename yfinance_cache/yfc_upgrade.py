@@ -12,50 +12,60 @@ from . import yfc_utils as yfcu
 from . import yfc_time as yfct
 
 
+def _ensure_yfc_dir():
+    """Create the _YFC_ sentinel directory for the file backend."""
+    if yfcm._get_backend() is None:
+        yfc_dp = os.path.join(yfcm.GetCacheDirpath(), "_YFC_")
+        os.makedirs(yfc_dp, exist_ok=True)
+
+
 def _tidy_upgrade_history():
-    actions = ["have-added-repaired-to-cached-divs",
-                "have-fixed-prices-final-again",
-                "have-reset-xcals-again",
-                "have-reset-ccy-cal",
-                "have-fixed-24h-prices-final",
-                "have-fixed-prices-final-again-x2",
-                "have-added-unexpected-intervals-to-options",
-                "have-added-event-type-to-earnings-dates",
-                "have-fixed-financials-dtypes"
-                ]
+    known_actions = ["have-added-repaired-to-cached-divs",
+                     "have-fixed-prices-final-again",
+                     "have-reset-xcals-again",
+                     "have-reset-ccy-cal",
+                     "have-fixed-24h-prices-final",
+                     "have-fixed-prices-final-again-x2",
+                     "have-added-unexpected-intervals-to-options",
+                     "have-added-event-type-to-earnings-dates",
+                     "have-fixed-financials-dtypes",
+                     "have-sorted-xcals",
+                     ]
+
+    b = yfcm._get_backend()
+    if b is not None:
+        for flag in b.list_upgrade_flags():
+            if flag not in known_actions:
+                b.delete_upgrade_flag(flag)
+        return
 
     d = yfcm.GetCacheDirpath()
     yfc_dp = os.path.join(d, "_YFC_")
     if not os.path.isdir(yfc_dp):
         return
     for f in os.listdir(yfc_dp):
-        if f not in actions:
+        if f not in known_actions:
             os.remove(os.path.join(yfc_dp, f))
 
 
 def _add_repaired_to_cached_divs():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-added-repaired-to-cached-divs")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-added-repaired-to-cached-divs"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     for d in contents:
@@ -118,35 +128,28 @@ def _add_repaired_to_cached_divs():
                         data['data'] = divs
                         pkl.dump(data, F, 4)
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _fix_prices_final_again():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-fixed-prices-final-again")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-fixed-prices-final-again"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     e = n/680
@@ -188,105 +191,84 @@ def _fix_prices_final_again():
                             data['data'] = h
                             pkl.dump(data, F, 4)
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _reset_cached_cals_again():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-reset-xcals-again")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-reset-xcals-again"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     for d in contents:
         if d.startswith("exchange-"):
             shutil.rmtree(os.path.join(dp, d))
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _reset_CCY_cal():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-reset-ccy-cal")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-reset-ccy-cal"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     d = 'exchange-CCY'
     if os.path.isdir(os.path.join(dp, d)):
         shutil.rmtree(os.path.join(dp, d))
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _fix_24_hour_prices_final():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-fixed-24h-prices-final")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-fixed-24h-prices-final"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     for d in os.listdir(dp):
@@ -321,35 +303,28 @@ def _fix_24_hour_prices_final():
                             data['data'] = h
                             pkl.dump(data, F, 4)
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _fix_prices_final_again_x2():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-fixed-prices-final-again-x2")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-fixed-prices-final-again-x2"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     e = n/680
@@ -395,58 +370,41 @@ def _fix_prices_final_again_x2():
                             data['data'] = h
                             pkl.dump(data, F, 4)
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _add_unexpected_intervals_to_options():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-added-unexpected-intervals-to-options")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-added-unexpected-intervals-to-options"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     o = yfcm._option_manager
     if 'calendar' not in o:
         o.calendar.accept_unexpected_Yahoo_intervals = True
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _add_event_type_to_earnings_dates():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-added-event-type-to-earnings-dates")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-added-event-type-to-earnings-dates"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     r = n/1200
@@ -487,35 +445,28 @@ def _add_event_type_to_earnings_dates():
                         data['data'] = edf
                         pkl.dump(data, F, 4)
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _fix_financials_dtypes():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-fixed-financials-dtypes")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-fixed-financials-dtypes"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     r = n/900
@@ -548,35 +499,28 @@ def _fix_financials_dtypes():
                     with open(fp, 'wb') as F:
                         pkl.dump(data, F, 4)
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)
 
 
 def _fix_xcals_being_unordered():
-    d = yfcm.GetCacheDirpath()
-    yfc_dp = os.path.join(d, "_YFC_")
-    state_fp = os.path.join(yfc_dp, "have-sorted-xcals")
-    if os.path.isfile(state_fp):
-        return
-    if not os.path.isdir(d):
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+    flag_name = "have-sorted-xcals"
+    if yfcm.IsUpgradeFlagSet(flag_name):
         return
 
     dp = yfcm.GetCacheDirpath()
+    if not os.path.isdir(dp):
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
+        return
+
     contents = os.listdir(dp)
     contents = [x for x in contents if x not in ['options.json', '_YFC_']]
 
     n = len(contents)
     if n == 0:
-        if not os.path.isdir(yfc_dp):
-            os.makedirs(yfc_dp)
-        with open(state_fp, 'w'):
-            pass
+        _ensure_yfc_dir()
+        yfcm.SetUpgradeFlag(flag_name)
         return
 
     for d in contents:
@@ -604,9 +548,5 @@ def _fix_xcals_being_unordered():
                     # Easiest to just delete and let yfc_time.py rebuild.
                     shutil.rmtree(os.path.join(dp, d))
 
-    if not os.path.isdir(yfc_dp):
-        os.makedirs(yfc_dp)
-    with open(state_fp, 'w'):
-        pass
-
-#
+    _ensure_yfc_dir()
+    yfcm.SetUpgradeFlag(flag_name)

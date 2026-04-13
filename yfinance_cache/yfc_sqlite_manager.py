@@ -832,7 +832,13 @@ class SqliteCacheBackend:
                 (ticker, object_name),
             ).fetchone()
             if row is None:
-                md = {key: value} if value is not None else {}
+                if value is None:
+                    # Deleting a key that doesn't exist — nothing to do.
+                    # Do NOT insert an empty metadata row; that creates an
+                    # orphan object_metadata entry with no corresponding data.
+                    conn.rollback()
+                    return
+                md = {key: value}
                 conn.execute(
                     """INSERT INTO object_metadata
                         (ticker, object_name, metadata_json, expiry_ns, tz_name)

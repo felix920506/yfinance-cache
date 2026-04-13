@@ -298,13 +298,15 @@ class Test_SqliteBackend(unittest.TestCase):
 
         result = self.backend.read_datum('AAPL', 'history-1d')
         self.assertIsNotNone(result)
-        # Compare core columns
+        # Compare core columns. Boolean columns are read back as pandas nullable
+        # boolean (dtype='boolean') to preserve NULL semantics, so skip dtype check.
         for col in ['Open', 'High', 'Low', 'Close', 'Volume', 'Dividends',
                     'Stock Splits', 'Final?']:
             pd.testing.assert_series_equal(
                 result[col].reset_index(drop=True),
                 df[col].reset_index(drop=True),
                 check_names=False,
+                check_dtype=False,
             )
 
     def test_price_history_timezone(self):
@@ -333,6 +335,23 @@ class Test_SqliteBackend(unittest.TestCase):
         result = self.backend.read_datum('AAPL', 'history-1d')
         for col in ('CSF', 'CDF', 'C-Check?', 'Repaired?'):
             self.assertIn(col, result.columns, f"Column {col!r} should be present")
+
+    def test_boolean_null_preserved_as_pd_na(self):
+        """NULL booleans must round-trip as pd.NA, not False."""
+        tz_info = ZoneInfo('US/Eastern')
+        index = pd.DatetimeIndex([datetime(2024, 1, 2, 9, 30, tzinfo=tz_info)])
+        # Use nullable boolean so pd.NA can be stored
+        df = pd.DataFrame({
+            'Open': [150.0], 'High': [155.0], 'Low': [149.0], 'Close': [153.0],
+            'Volume': [1e6], 'Dividends': [0.0], 'Stock Splits': [0.0],
+            'FetchDate': pd.DatetimeIndex([pd.Timestamp('2024-01-03', tz='UTC')]),
+            'Final?': pd.array([pd.NA], dtype='boolean'),
+        }, index=index)
+        self.backend.store_datum('AAPL', 'history-1d', df)
+        result = self.backend.read_datum('AAPL', 'history-1d')
+        # Must come back as pd.NA, not False
+        self.assertTrue(pd.isna(result['Final?'].iloc[0]),
+                        "NULL Final? should round-trip as pd.NA, not False")
 
     def test_dividends_structured(self):
         """Store and read a dividends DataFrame via the structured table."""

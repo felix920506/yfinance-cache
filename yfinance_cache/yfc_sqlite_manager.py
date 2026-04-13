@@ -161,8 +161,9 @@ def _bool_to_int(v) -> int | None:
     return int(bool(v))
 
 
-def _int_to_bool(v) -> bool | None:
-    return None if v is None else bool(v)
+def _int_to_bool(v):
+    """Convert a SQLite INTEGER (0/1/NULL) to a Python bool or pd.NA."""
+    return pd.NA if v is None else bool(v)
 
 
 def _real(v) -> float | None:
@@ -531,8 +532,8 @@ class SqliteCacheBackend:
         )
 
         df['Final?'] = pd.array(
-            [bool(r['final']) if r['final'] is not None else False for r in rows],
-            dtype='bool',
+            [_int_to_bool(r['final']) for r in rows],
+            dtype='boolean',
         )
 
         # Optional columns — only include if at least one non-NULL value
@@ -541,8 +542,8 @@ class SqliteCacheBackend:
             vals = [r[sql_col] for r in rows]
             if any(v is not None for v in vals):
                 df[df_col] = pd.array(
-                    [bool(v) if v is not None else False for v in vals],
-                    dtype='bool',
+                    [_int_to_bool(v) for v in vals],
+                    dtype='boolean',
                 )
 
         _opt_real = [('csf', 'CSF'), ('cdf', 'CDF')]
@@ -583,8 +584,7 @@ class SqliteCacheBackend:
             'Back Adj.':               pd.array([r['back_adj']            for r in rows], dtype='float64'),
             'FetchDate':               _fetch_dates('fetch_date_ns'),
             'Close before':            pd.array([r['close_before']        for r in rows], dtype='float64'),
-            'Close repaired?':         pd.array([bool(r['close_repaired']) if r['close_repaired'] is not None
-                                                  else False for r in rows], dtype='bool'),
+            'Close repaired?':         pd.array([_int_to_bool(r['close_repaired']) for r in rows], dtype='boolean'),
             'Superseded div':          pd.array([r['superseded_div']      for r in rows], dtype='float64'),
             'Superseded back adj.':    pd.array([r['superseded_back_adj'] for r in rows], dtype='float64'),
             'Superseded div FetchDate': _fetch_dates('superseded_fetch_ns'),
@@ -637,8 +637,7 @@ class SqliteCacheBackend:
             'Surprise(%)':   pd.array([r['surprise_pct']  for r in rows], dtype='float64'),
             'Event Type':    [r['event_type']              for r in rows],
             'FetchDate':     _fetch_dates('fetch_date_ns'),
-            'Date confirmed?': pd.array([bool(r['date_confirmed']) if r['date_confirmed'] is not None
-                                          else False for r in rows], dtype='bool'),
+            'Date confirmed?': pd.array([_int_to_bool(r['date_confirmed']) for r in rows], dtype='boolean'),
         }, index=index)
 
         return df

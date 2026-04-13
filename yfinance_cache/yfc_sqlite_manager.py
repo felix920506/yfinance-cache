@@ -344,18 +344,37 @@ class SqliteCacheBackend:
         )
 
     def _check_and_delete_if_expired(self, ticker: str, object_name: str) -> bool:
-        """Return True if the KV item has expired (also deletes it)."""
-        row = self._conn().execute(
-            "SELECT expiry_ns FROM object_metadata WHERE ticker=? AND object_name=?",
-            (ticker, object_name),
-        ).fetchone()
-        if row is None or row['expiry_ns'] is None:
-            return False
+        """Return True if the KV item has expired (and atomically deletes it).
+
+        The check and delete happen inside a single BEGIN IMMEDIATE transaction
+        to prevent a TOCTOU race where another thread writes a fresh value
+        between this thread's expiry check and the subsequent delete.
+        """
+        conn = self._conn()
         now_ns = int(pd.Timestamp.now('UTC').value)
-        if now_ns >= row['expiry_ns']:
-            self.delete_datum(ticker, object_name)
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT expiry_ns FROM object_metadata WHERE ticker=? AND object_name=?",
+                (ticker, object_name),
+            ).fetchone()
+            if row is None or row['expiry_ns'] is None or now_ns < row['expiry_ns']:
+                conn.rollback()
+                return False
+            # Expired: delete data and metadata atomically within this transaction.
+            conn.execute(
+                "DELETE FROM cache_kv WHERE ticker=? AND object_name=?",
+                (ticker, object_name),
+            )
+            conn.execute(
+                "DELETE FROM object_metadata WHERE ticker=? AND object_name=?",
+                (ticker, object_name),
+            )
+            conn.commit()
             return True
-        return False
+        except Exception:
+            conn.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # Internal: structured table writers

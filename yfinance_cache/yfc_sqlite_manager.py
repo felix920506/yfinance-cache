@@ -262,6 +262,11 @@ class SqliteCacheBackend:
     SQLite-backed cache with per-thread connections and WAL mode.
 
     Structured objects use typed tables; everything else uses cache_kv.
+
+    Each thread gets its own sqlite3.Connection (via threading.local) so
+    that WAL-mode concurrent reads don't contend with each other.  All
+    connections are tracked in ``_all_conns`` so that ``close()`` can
+    release every file descriptor regardless of which thread calls it.
     """
 
     def __init__(self, db_path: str):
@@ -269,6 +274,11 @@ class SqliteCacheBackend:
         self._local = threading.local()
         self._schema_lock = threading.Lock()
         self._schema_created = False
+        # Track every connection created across all threads so close() can
+        # flush and shut them all down, preventing file-descriptor leaks when
+        # worker threads terminate without calling close() themselves.
+        self._all_conns: list[sqlite3.Connection] = []
+        self._all_conns_lock = threading.Lock()
         self._ensure_schema()
 
     # ------------------------------------------------------------------
@@ -287,6 +297,8 @@ class SqliteCacheBackend:
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.row_factory = sqlite3.Row
             self._local.conn = conn
+            with self._all_conns_lock:
+                self._all_conns.append(conn)
         return conn
 
     def _ensure_schema(self):
@@ -297,10 +309,25 @@ class SqliteCacheBackend:
             self._schema_created = True
 
     def close(self):
-        conn = getattr(self._local, 'conn', None)
-        if conn is not None:
-            conn.close()
-            self._local.conn = None
+        """Close all connections opened by any thread and checkpoint the WAL.
+
+        Safe to call from any thread.  After this call the backend should not
+        be used further (each thread that needs it again must re-open via a
+        new SqliteCacheBackend instance).
+        """
+        with self._all_conns_lock:
+            for conn in self._all_conns:
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception:
+                    pass
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._all_conns.clear()
+        # Also clear the current thread's reference so _conn() re-creates if needed.
+        self._local.conn = None
 
     # ------------------------------------------------------------------
     # Internal: metadata table

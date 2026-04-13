@@ -14,7 +14,13 @@ import pandas as pd
 
 from pprint import pprint
 
-class Test_Yfc_Cache(unittest.TestCase):
+
+class _CacheTestMixin:
+    """
+    Mixin that parametrises Test_Yfc_Cache tests for a given backend.
+    Subclasses set `cache_backend = 'files'` or `'sqlite'`.
+    """
+    cache_backend = 'files'
 
     def setUp(self):
         self.ticker = "INTC"
@@ -22,10 +28,19 @@ class Test_Yfc_Cache(unittest.TestCase):
 
         self.tempCacheDir = tempfile.TemporaryDirectory()
         yfcm.SetCacheDirpath(self.tempCacheDir.name)
-
+        yfcm._option_manager.cache.cache_backend = self.cache_backend
+        # Reset SQLite singleton so it picks up the new temp dir
+        yfcm._sqlite_backend = None
 
     def tearDown(self):
+        yfcm._option_manager.cache.cache_backend = 'files'
+        yfcm._sqlite_backend = None
         self.tempCacheDir.cleanup()
+
+
+class Test_Yfc_Cache(_CacheTestMixin, unittest.TestCase):
+    """Original file-backend test suite (unchanged behaviour)."""
+    cache_backend = 'files'
 
 
     def testGetFilepath(self):
@@ -250,6 +265,84 @@ class Test_Yfc_Cache(unittest.TestCase):
         obj,mdc = yfcm.ReadCacheDatum(self.ticker, var, return_metadata_too=True)
         self.assertEqual(obj, value)
         self.assertEqual(mdc, {key:val2})
+
+    def test_cache_backend_option_valid(self):
+        yfcm._option_manager.cache.cache_backend = 'sqlite'
+        yfcm._option_manager.cache.cache_backend = 'files'
+
+    def test_cache_backend_option_invalid(self):
+        with self.assertRaises(ValueError):
+            yfcm._option_manager.cache.cache_backend = 'redis'
+
+
+class Test_Yfc_Cache_Sqlite(_CacheTestMixin, unittest.TestCase):
+    """
+    Runs the same cache tests against the SQLite backend.
+
+    File-specific assertions (checking actual .json/.pkl files on disk)
+    are skipped because the SQLite backend does not create those files.
+    """
+    cache_backend = 'sqlite'
+
+    def testGetFilepath(self):
+        # GetFilepath is a file-backend concept; skip for SQLite.
+        pass
+
+    def test_cache_store(self):
+        value = 123
+        self.assertFalse(yfcm.IsDatumCached(self.ticker, self.objName))
+        yfcm.StoreCacheDatum(self.ticker, self.objName, value)
+        self.assertTrue(yfcm.IsDatumCached(self.ticker, self.objName))
+        obj = yfcm.ReadCacheDatum(self.ticker, self.objName)
+        self.assertEqual(obj, value)
+
+    def test_cache_store_expiry(self):
+        from zoneinfo import ZoneInfo
+        value = 123
+        dt = pd.Timestamp.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+        exp = dt + timedelta(seconds=1)
+        yfcm.StoreCacheDatum(self.ticker, self.objName, value, expiry=exp)
+        self.assertTrue(yfcm.IsDatumCached(self.ticker, self.objName))
+        obj = yfcm.ReadCacheDatum(self.ticker, self.objName)
+        self.assertEqual(obj, value)
+        sleep(1)
+        obj = yfcm.ReadCacheDatum(self.ticker, self.objName)
+        self.assertIsNone(obj)
+        self.assertFalse(yfcm.IsDatumCached(self.ticker, self.objName))
+
+    def test_cache_store_packed(self):
+        var1 = "balance_sheet"
+        val1 = 123
+        var2 = "cashflow"
+        val2 = 456
+        yfcm.StoreCachePackedDatum(self.ticker, var1, val1)
+        yfcm.StoreCachePackedDatum(self.ticker, var2, val2)
+        self.assertTrue(yfcm.IsDatumCached(self.ticker, var1))
+        self.assertTrue(yfcm.IsDatumCached(self.ticker, var2))
+        self.assertEqual(yfcm.ReadCachePackedDatum(self.ticker, var1), val1)
+        self.assertEqual(yfcm.ReadCachePackedDatum(self.ticker, var2), val2)
+
+    def test_cache_store_packed_expiry(self):
+        from zoneinfo import ZoneInfo
+        var = "balance_sheet"
+        value = 123
+        dt = pd.Timestamp.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+        exp = dt + timedelta(seconds=1)
+        yfcm.StoreCachePackedDatum(self.ticker, var, value, expiry=exp)
+        self.assertTrue(yfcm.IsDatumCached(self.ticker, var))
+        self.assertEqual(yfcm.ReadCachePackedDatum(self.ticker, var), value)
+        sleep(1)
+        obj = yfcm.ReadCachePackedDatum(self.ticker, var)
+        self.assertIsNone(obj)
+        self.assertFalse(yfcm.IsDatumCached(self.ticker, var))
+
+    def test_cache_store_types(self):
+        values = [int(1), float(1), [1, 3], {'a': 1, 'b': 2}, set([1, 3])]
+        for value in values:
+            yfcm.StoreCacheDatum(self.ticker, self.objName, value)
+            obj = yfcm.ReadCacheDatum(self.ticker, self.objName)
+            self.assertEqual(obj, value)
+
 
 if __name__ == '__main__':
     unittest.main()
